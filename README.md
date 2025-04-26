@@ -1,5 +1,6 @@
+<!-- BEGIN_TF_DOCS -->
 <p align="center">
-  <img src="logo.svg" alt="Self-Healing Infrastructure" width="200"/>
+  <img src="https://raw.githubusercontent.com/yashodhan271/terraform-aws-self-healing-infrastructure/main/logo.svg" alt="Self-Healing Infrastructure" width="200"/>
 </p>
 
 # Self-Healing Infrastructure Terraform Module
@@ -303,6 +304,43 @@ Future enhancements planned for this module:
 - Integration with AWS Control Tower and Organizations
 - Support for cross-account healing
 
+## Requirements
+
+| Name | Version |
+|------|---------|
+| terraform | >= 1.0.0 |
+| aws | >= 4.0.0 |
+
+## Providers
+
+| Name | Version |
+|------|---------|
+| aws | >= 4.0.0 |
+| archive | >= 2.0.0 |
+
+## Inputs
+
+| Name | Description | Type | Default | Required |
+|------|-------------|------|---------|:--------:|
+| region | AWS region where resources will be deployed | `string` | `"us-east-1"` | no |
+| name_prefix | Prefix to be used for naming resources | `string` | `"self-healing"` | no |
+| tags | Tags to apply to all resources | `map(string)` | `{}` | no |
+| enable_notifications | Whether to enable SNS notifications for healing events | `bool` | `true` | no |
+| create_dashboard | Whether to create a CloudWatch dashboard for monitoring self-healing metrics | `bool` | `true` | no |
+| log_retention_days | Number of days to retain CloudWatch logs | `number` | `30` | no |
+| healing_check_interval | Interval in minutes for checking resource health and configuration | `number` | `5` | no |
+| max_healing_attempts | Maximum number of healing attempts before giving up | `number` | `3` | no |
+| healing_timeout_seconds | Timeout in seconds for healing operations | `number` | `300` | no |
+
+## Outputs
+
+| Name | Description |
+|------|-------------|
+| sns_topic_arn | ARN of the SNS topic for healing notifications |
+| dashboard_name | Name of the CloudWatch dashboard for monitoring self-healing metrics |
+| module_version | Version of the self-healing infrastructure module |
+
 ## License
 
 MIT
+<!-- END_TF_DOCS -->
