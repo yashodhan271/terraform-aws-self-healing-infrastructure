@@ -2,12 +2,23 @@ import boto3
 import os
 import json
 import time
+import logging
+import gc
 from datetime import datetime
 
-# Initialize AWS clients
-rds_client = boto3.client('rds')
-cloudwatch_client = boto3.client('cloudwatch')
-sns_client = boto3.client('sns')
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Initialize AWS clients with connection pooling and timeout settings
+session = boto3.Session()
+rds_client = session.client('rds', config=boto3.config.Config(
+    connect_timeout=5,
+    read_timeout=10,
+    retries={'max_attempts': 3}
+))
+cloudwatch_client = session.client('cloudwatch')
+sns_client = session.client('sns')
 
 # Get environment variables
 DB_INSTANCE_ID = os.environ.get('DB_INSTANCE_ID')
@@ -16,21 +27,28 @@ SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN', '')
 ORIGINAL_INSTANCE_CLASS = os.environ.get('ORIGINAL_INSTANCE_CLASS')
 ORIGINAL_ALLOCATED_STORAGE = int(os.environ.get('ORIGINAL_ALLOCATED_STORAGE', 0))
 ORIGINAL_ENGINE_VERSION = os.environ.get('ORIGINAL_ENGINE_VERSION')
+BACKUP_VERIFICATION = os.environ.get('BACKUP_VERIFICATION', 'false').lower() == 'true'
+
+# Constants
+RETRY_COUNT = 3
+RETRY_DELAY = 2  # seconds
 
 def lambda_handler(event, context):
     """
     Main handler for RDS self-healing Lambda function.
     Handles both performance issues and configuration drift.
     """
-    print(f"Received event: {json.dumps(event)}")
+    logger.info(f"Received event: {json.dumps(event)}")
     
     # Determine the type of event (performance issue or scheduled drift check)
     event_type = determine_event_type(event)
     
-    # Get current instance details
-    instance_details = get_instance_details(DB_INSTANCE_ID)
+    # Get current instance details with retry logic
+    instance_details = get_instance_details_with_retry(DB_INSTANCE_ID)
     if not instance_details:
-        send_notification(f"Unable to retrieve details for DB instance {DB_INSTANCE_ID}")
+        message = f"Unable to retrieve details for DB instance {DB_INSTANCE_ID} after multiple attempts"
+        logger.error(message)
+        send_notification(message)
         return {
             'statusCode': 500,
             'body': json.dumps('Failed to retrieve instance details')
@@ -39,7 +57,9 @@ def lambda_handler(event, context):
     # Check healing attempts to avoid infinite loops
     healing_attempts = get_healing_attempts(instance_details)
     if healing_attempts >= MAX_HEALING_ATTEMPTS:
-        send_notification(f"Maximum healing attempts ({MAX_HEALING_ATTEMPTS}) reached for DB instance {DB_INSTANCE_ID}")
+        message = f"Maximum healing attempts ({MAX_HEALING_ATTEMPTS}) reached for DB instance {DB_INSTANCE_ID}"
+        logger.warning(message)
+        send_notification(message)
         return {
             'statusCode': 429,
             'body': json.dumps('Maximum healing attempts reached')
@@ -50,11 +70,16 @@ def lambda_handler(event, context):
         result = handle_performance_issue(instance_details, event, healing_attempts)
     elif event_type == 'config_drift':
         result = handle_config_drift(instance_details, healing_attempts)
+    elif event_type == 'backup_verification':
+        result = verify_backups(instance_details)
     else:
         result = {
             'statusCode': 400,
             'body': json.dumps('Unknown event type')
         }
+    
+    # Clean up memory to prevent leaks
+    gc.collect()
     
     return result
 
@@ -69,18 +94,25 @@ def determine_event_type(event):
     # Otherwise, assume it's a scheduled drift check
     return 'config_drift'
 
-def get_instance_details(db_instance_id):
+def get_instance_details_with_retry(db_instance_id, max_retries=RETRY_COUNT):
     """
-    Get details about the RDS instance.
+    Get details about the RDS instance with retry logic for transient failures.
     """
-    try:
-        response = rds_client.describe_db_instances(DBInstanceIdentifier=db_instance_id)
-        if response['DBInstances']:
-            return response['DBInstances'][0]
-        return None
-    except Exception as e:
-        print(f"Error getting instance details: {str(e)}")
-        return None
+    retries = 0
+    while retries < max_retries:
+        try:
+            response = rds_client.describe_db_instances(DBInstanceIdentifier=db_instance_id)
+            if response['DBInstances']:
+                return response['DBInstances'][0]
+            return None
+        except Exception as e:
+            logger.warning(f"Error getting instance details (attempt {retries+1}/{max_retries}): {str(e)}")
+            retries += 1
+            if retries < max_retries:
+                time.sleep(RETRY_DELAY)
+    
+    logger.error(f"Failed to get instance details after {max_retries} attempts")
+    return None
 
 def get_healing_attempts(instance_details):
     """
@@ -100,7 +132,7 @@ def get_healing_attempts(instance_details):
         
         return 0
     except Exception as e:
-        print(f"Error getting healing attempts: {str(e)}")
+        logger.error(f"Error getting healing attempts: {str(e)}")
         return 0
 
 def increment_healing_attempts(instance_arn, current_attempts):
@@ -123,7 +155,7 @@ def increment_healing_attempts(instance_arn, current_attempts):
         )
         return True
     except Exception as e:
-        print(f"Error incrementing healing attempts: {str(e)}")
+        logger.error(f"Error incrementing healing attempts: {str(e)}")
         return False
 
 def handle_performance_issue(instance_details, event, healing_attempts):
@@ -133,12 +165,19 @@ def handle_performance_issue(instance_details, event, healing_attempts):
     db_instance_id = instance_details['DBInstanceIdentifier']
     db_instance_status = instance_details['DBInstanceStatus']
     
-    print(f"Handling performance issue for DB instance {db_instance_id} in status {db_instance_status}")
+    logger.info(f"Handling performance issue for DB instance {db_instance_id} in status {db_instance_status}")
     
     # Get alarm details to determine the specific issue
     alarm_name = None
+    alarm_details = {}
+    
     if 'detail' in event and 'alarmName' in event['detail']:
         alarm_name = event['detail']['alarmName']
+        
+        # Extract more detailed metrics from the alarm
+        if 'metrics' in event['detail']:
+            alarm_details = event['detail']['metrics']
+            logger.info(f"Extracted metrics from alarm: {json.dumps(alarm_details)}")
     
     # Increment healing attempts
     increment_healing_attempts(instance_details['DBInstanceArn'], healing_attempts)
@@ -146,36 +185,43 @@ def handle_performance_issue(instance_details, event, healing_attempts):
     # Apply healing action based on instance status and alarm
     if db_instance_status == 'available':
         # Determine the appropriate action based on the alarm
-        if alarm_name and 'cpu-utilization' in alarm_name.lower():
-            return handle_cpu_issue(db_instance_id, instance_details)
-        elif alarm_name and 'free-storage-space' in alarm_name.lower():
-            return handle_storage_issue(db_instance_id, instance_details)
-        elif alarm_name and 'database-connections' in alarm_name.lower():
-            return handle_connections_issue(db_instance_id, instance_details)
-        else:
-            # If we can't determine the specific issue, try a reboot
-            try:
-                rds_client.reboot_db_instance(
-                    DBInstanceIdentifier=db_instance_id,
-                    ForceFailover=False
-                )
-                message = f"Rebooted DB instance {db_instance_id} due to performance issue"
-                print(message)
-                send_notification(message)
-                
-                return {
-                    'statusCode': 200,
-                    'body': json.dumps('DB instance reboot initiated')
-                }
-            except Exception as e:
-                print(f"Error rebooting DB instance: {str(e)}")
-                return {
-                    'statusCode': 500,
-                    'body': json.dumps('Failed to heal DB instance')
-                }
+        if alarm_name:
+            if 'cpu-utilization' in alarm_name.lower():
+                return handle_cpu_issue(db_instance_id, instance_details, alarm_details)
+            elif 'free-storage-space' in alarm_name.lower():
+                return handle_storage_issue(db_instance_id, instance_details, alarm_details)
+            elif 'database-connections' in alarm_name.lower():
+                return handle_connections_issue(db_instance_id, instance_details, alarm_details)
+            elif 'memory' in alarm_name.lower():
+                return handle_memory_issue(db_instance_id, instance_details, alarm_details)
+            elif 'replica-lag' in alarm_name.lower():
+                return handle_replica_lag_issue(db_instance_id, instance_details, alarm_details)
+            elif 'io-utilization' in alarm_name.lower():
+                return handle_io_issue(db_instance_id, instance_details, alarm_details)
+        
+        # If we can't determine the specific issue, try a reboot
+        try:
+            rds_client.reboot_db_instance(
+                DBInstanceIdentifier=db_instance_id,
+                ForceFailover=False
+            )
+            message = f"Rebooted DB instance {db_instance_id} due to performance issue"
+            logger.info(message)
+            send_notification(message)
+            
+            return {
+                'statusCode': 200,
+                'body': json.dumps('DB instance reboot initiated')
+            }
+        except Exception as e:
+            logger.error(f"Error rebooting DB instance: {str(e)}")
+            return {
+                'statusCode': 500,
+                'body': json.dumps('Failed to heal DB instance')
+            }
     else:
         message = f"DB instance {db_instance_id} is in status {db_instance_status}, no healing action taken"
-        print(message)
+        logger.info(message)
         send_notification(message)
         
         return {
@@ -183,11 +229,17 @@ def handle_performance_issue(instance_details, event, healing_attempts):
             'body': json.dumps('No healing action taken')
         }
 
-def handle_cpu_issue(db_instance_id, instance_details):
+def handle_cpu_issue(db_instance_id, instance_details, alarm_details=None):
     """
     Handle high CPU utilization by scaling up the instance if needed.
     """
     current_instance_class = instance_details['DBInstanceClass']
+    
+    # Get detailed CPU metrics if available
+    cpu_utilization = None
+    if alarm_details and 'cpu' in alarm_details:
+        cpu_utilization = alarm_details['cpu']
+        logger.info(f"CPU utilization details: {cpu_utilization}%")
     
     # Check if we can scale up the instance
     if current_instance_class != ORIGINAL_INSTANCE_CLASS and is_instance_class_larger(ORIGINAL_INSTANCE_CLASS, current_instance_class):
@@ -199,7 +251,7 @@ def handle_cpu_issue(db_instance_id, instance_details):
                 ApplyImmediately=True
             )
             message = f"Scaling up DB instance {db_instance_id} from {current_instance_class} to {ORIGINAL_INSTANCE_CLASS} due to high CPU"
-            print(message)
+            logger.info(message)
             send_notification(message)
             
             return {
@@ -207,7 +259,7 @@ def handle_cpu_issue(db_instance_id, instance_details):
                 'body': json.dumps('DB instance scaling initiated')
             }
         except Exception as e:
-            print(f"Error scaling up DB instance: {str(e)}")
+            logger.error(f"Error scaling up DB instance: {str(e)}")
     
     # If we can't scale up or there was an error, try a reboot
     try:
@@ -216,7 +268,7 @@ def handle_cpu_issue(db_instance_id, instance_details):
             ForceFailover=False
         )
         message = f"Rebooted DB instance {db_instance_id} due to high CPU utilization"
-        print(message)
+        logger.info(message)
         send_notification(message)
         
         return {
@@ -224,17 +276,23 @@ def handle_cpu_issue(db_instance_id, instance_details):
             'body': json.dumps('DB instance reboot initiated')
         }
     except Exception as e:
-        print(f"Error rebooting DB instance: {str(e)}")
+        logger.error(f"Error rebooting DB instance: {str(e)}")
         return {
             'statusCode': 500,
             'body': json.dumps('Failed to heal DB instance')
         }
 
-def handle_storage_issue(db_instance_id, instance_details):
+def handle_storage_issue(db_instance_id, instance_details, alarm_details=None):
     """
     Handle low storage space by increasing allocated storage.
     """
     current_allocated_storage = instance_details['AllocatedStorage']
+    
+    # Get detailed storage metrics if available
+    free_storage = None
+    if alarm_details and 'free_storage' in alarm_details:
+        free_storage = alarm_details['free_storage']
+        logger.info(f"Free storage details: {free_storage}GB")
     
     # Check if we need to increase storage
     if current_allocated_storage < ORIGINAL_ALLOCATED_STORAGE:
@@ -246,7 +304,7 @@ def handle_storage_issue(db_instance_id, instance_details):
                 ApplyImmediately=True
             )
             message = f"Increasing storage for DB instance {db_instance_id} from {current_allocated_storage}GB to {ORIGINAL_ALLOCATED_STORAGE}GB due to low storage space"
-            print(message)
+            logger.info(message)
             send_notification(message)
             
             return {
@@ -254,7 +312,7 @@ def handle_storage_issue(db_instance_id, instance_details):
                 'body': json.dumps('DB instance storage increase initiated')
             }
         except Exception as e:
-            print(f"Error increasing DB instance storage: {str(e)}")
+            logger.error(f"Error increasing DB instance storage: {str(e)}")
     elif current_allocated_storage == ORIGINAL_ALLOCATED_STORAGE:
         # If we're already at the original storage, increase by 20%
         new_storage = int(current_allocated_storage * 1.2)
@@ -265,7 +323,7 @@ def handle_storage_issue(db_instance_id, instance_details):
                 ApplyImmediately=True
             )
             message = f"Increasing storage for DB instance {db_instance_id} from {current_allocated_storage}GB to {new_storage}GB due to low storage space"
-            print(message)
+            logger.info(message)
             send_notification(message)
             
             return {
@@ -273,11 +331,11 @@ def handle_storage_issue(db_instance_id, instance_details):
                 'body': json.dumps('DB instance storage increase initiated')
             }
         except Exception as e:
-            print(f"Error increasing DB instance storage: {str(e)}")
+            logger.error(f"Error increasing DB instance storage: {str(e)}")
     
     # If we can't increase storage or there was an error, notify
     message = f"Unable to increase storage for DB instance {db_instance_id}. Manual intervention required."
-    print(message)
+    logger.info(message)
     send_notification(message)
     
     return {
@@ -285,17 +343,23 @@ def handle_storage_issue(db_instance_id, instance_details):
         'body': json.dumps('Manual intervention required for storage issue')
     }
 
-def handle_connections_issue(db_instance_id, instance_details):
+def handle_connections_issue(db_instance_id, instance_details, alarm_details=None):
     """
     Handle high connection count by rebooting the instance.
     """
+    # Get detailed connection metrics if available
+    connections = None
+    if alarm_details and 'connections' in alarm_details:
+        connections = alarm_details['connections']
+        logger.info(f"Connection count details: {connections}")
+    
     try:
         rds_client.reboot_db_instance(
             DBInstanceIdentifier=db_instance_id,
             ForceFailover=False
         )
         message = f"Rebooted DB instance {db_instance_id} due to high connection count"
-        print(message)
+        logger.info(message)
         send_notification(message)
         
         return {
@@ -303,10 +367,240 @@ def handle_connections_issue(db_instance_id, instance_details):
             'body': json.dumps('DB instance reboot initiated')
         }
     except Exception as e:
-        print(f"Error rebooting DB instance: {str(e)}")
+        logger.error(f"Error rebooting DB instance: {str(e)}")
         return {
             'statusCode': 500,
             'body': json.dumps('Failed to heal DB instance')
+        }
+
+def handle_memory_issue(db_instance_id, instance_details, alarm_details=None):
+    """
+    Handle memory-related issues by scaling up or rebooting the instance.
+    """
+    current_instance_class = instance_details['DBInstanceClass']
+    
+    # Get detailed memory metrics if available
+    memory_utilization = None
+    if alarm_details and 'memory' in alarm_details:
+        memory_utilization = alarm_details['memory']
+        logger.info(f"Memory utilization details: {memory_utilization}%")
+    
+    # Check if we can scale up the instance
+    if current_instance_class != ORIGINAL_INSTANCE_CLASS and is_instance_class_larger(ORIGINAL_INSTANCE_CLASS, current_instance_class):
+        # If the current instance is smaller than the original, scale back up
+        try:
+            rds_client.modify_db_instance(
+                DBInstanceIdentifier=db_instance_id,
+                DBInstanceClass=ORIGINAL_INSTANCE_CLASS,
+                ApplyImmediately=True
+            )
+            message = f"Scaling up DB instance {db_instance_id} from {current_instance_class} to {ORIGINAL_INSTANCE_CLASS} due to high memory usage"
+            logger.info(message)
+            send_notification(message)
+            
+            return {
+                'statusCode': 200,
+                'body': json.dumps('DB instance scaling initiated')
+            }
+        except Exception as e:
+            logger.error(f"Error scaling up DB instance: {str(e)}")
+    
+    # If we can't scale up or there was an error, try a reboot
+    try:
+        rds_client.reboot_db_instance(
+            DBInstanceIdentifier=db_instance_id,
+            ForceFailover=False
+        )
+        message = f"Rebooted DB instance {db_instance_id} due to high memory usage"
+        logger.info(message)
+        send_notification(message)
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps('DB instance reboot initiated')
+        }
+    except Exception as e:
+        logger.error(f"Error rebooting DB instance: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps('Failed to heal DB instance')
+        }
+
+def handle_replica_lag_issue(db_instance_id, instance_details, alarm_details=None):
+    """
+    Handle replica lag issues by rebooting the replica.
+    """
+    # Get detailed replica lag metrics if available
+    replica_lag = None
+    if alarm_details and 'replica_lag' in alarm_details:
+        replica_lag = alarm_details['replica_lag']
+        logger.info(f"Replica lag details: {replica_lag} seconds")
+    
+    try:
+        rds_client.reboot_db_instance(
+            DBInstanceIdentifier=db_instance_id,
+            ForceFailover=False
+        )
+        message = f"Rebooted DB replica {db_instance_id} due to high replica lag"
+        logger.info(message)
+        send_notification(message)
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps('DB replica reboot initiated')
+        }
+    except Exception as e:
+        logger.error(f"Error rebooting DB replica: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps('Failed to heal DB replica')
+        }
+
+def handle_io_issue(db_instance_id, instance_details, alarm_details=None):
+    """
+    Handle I/O-related issues by optimizing or scaling up the instance.
+    """
+    current_instance_class = instance_details['DBInstanceClass']
+    
+    # Get detailed I/O metrics if available
+    io_utilization = None
+    if alarm_details and 'io' in alarm_details:
+        io_utilization = alarm_details['io']
+        logger.info(f"I/O utilization details: {io_utilization}%")
+    
+    # Check if we can scale up the instance
+    if current_instance_class != ORIGINAL_INSTANCE_CLASS and is_instance_class_larger(ORIGINAL_INSTANCE_CLASS, current_instance_class):
+        # If the current instance is smaller than the original, scale back up
+        try:
+            rds_client.modify_db_instance(
+                DBInstanceIdentifier=db_instance_id,
+                DBInstanceClass=ORIGINAL_INSTANCE_CLASS,
+                ApplyImmediately=True
+            )
+            message = f"Scaling up DB instance {db_instance_id} from {current_instance_class} to {ORIGINAL_INSTANCE_CLASS} due to high I/O utilization"
+            logger.info(message)
+            send_notification(message)
+            
+            return {
+                'statusCode': 200,
+                'body': json.dumps('DB instance scaling initiated')
+            }
+        except Exception as e:
+            logger.error(f"Error scaling up DB instance: {str(e)}")
+    
+    # If we can't scale up or there was an error, try a reboot
+    try:
+        rds_client.reboot_db_instance(
+            DBInstanceIdentifier=db_instance_id,
+            ForceFailover=False
+        )
+        message = f"Rebooted DB instance {db_instance_id} due to high I/O utilization"
+        logger.info(message)
+        send_notification(message)
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps('DB instance reboot initiated')
+        }
+    except Exception as e:
+        logger.error(f"Error rebooting DB instance: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps('Failed to heal DB instance')
+        }
+
+def verify_backups(instance_details):
+    """
+    Verify that backups for the RDS instance are working correctly.
+    """
+    if not BACKUP_VERIFICATION:
+        logger.info("Backup verification is disabled")
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Backup verification is disabled')
+        }
+    
+    db_instance_id = instance_details['DBInstanceIdentifier']
+    logger.info(f"Verifying backups for DB instance {db_instance_id}")
+    
+    try:
+        # Check if automated backups are enabled
+        if not instance_details.get('BackupRetentionPeriod', 0) > 0:
+            message = f"Automated backups are not enabled for DB instance {db_instance_id}"
+            logger.warning(message)
+            send_notification(message)
+            return {
+                'statusCode': 200,
+                'body': json.dumps('Automated backups not enabled')
+            }
+        
+        # Get the latest automated snapshot
+        response = rds_client.describe_db_snapshots(
+            DBInstanceIdentifier=db_instance_id,
+            SnapshotType='automated'
+        )
+        
+        if not response.get('DBSnapshots'):
+            message = f"No automated snapshots found for DB instance {db_instance_id}"
+            logger.warning(message)
+            send_notification(message)
+            return {
+                'statusCode': 200,
+                'body': json.dumps('No automated snapshots found')
+            }
+        
+        # Sort snapshots by creation time (newest first)
+        snapshots = sorted(
+            response['DBSnapshots'],
+            key=lambda x: x.get('SnapshotCreateTime', datetime.min),
+            reverse=True
+        )
+        
+        latest_snapshot = snapshots[0]
+        snapshot_id = latest_snapshot['DBSnapshotIdentifier']
+        snapshot_status = latest_snapshot['Status']
+        snapshot_time = latest_snapshot.get('SnapshotCreateTime')
+        
+        # Check if the latest snapshot is in a valid state
+        if snapshot_status != 'available':
+            message = f"Latest snapshot {snapshot_id} for DB instance {db_instance_id} is in status {snapshot_status}, not available"
+            logger.warning(message)
+            send_notification(message)
+            return {
+                'statusCode': 200,
+                'body': json.dumps('Latest snapshot not available')
+            }
+        
+        # Check if the latest snapshot is recent (within the last 24 hours)
+        if snapshot_time:
+            now = datetime.now().replace(tzinfo=snapshot_time.tzinfo)
+            age_hours = (now - snapshot_time).total_seconds() / 3600
+            
+            if age_hours > 24:
+                message = f"Latest snapshot {snapshot_id} for DB instance {db_instance_id} is {age_hours:.1f} hours old"
+                logger.warning(message)
+                send_notification(message)
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps('Latest snapshot is too old')
+                }
+        
+        message = f"Backup verification successful for DB instance {db_instance_id}. Latest snapshot {snapshot_id} is available."
+        logger.info(message)
+        send_notification(message)
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Backup verification successful')
+        }
+    except Exception as e:
+        error_message = f"Error verifying backups for DB instance {db_instance_id}: {str(e)}"
+        logger.error(error_message)
+        send_notification(error_message)
+        
+        return {
+            'statusCode': 500,
+            'body': json.dumps('Backup verification failed')
         }
 
 def handle_config_drift(instance_details, healing_attempts):
@@ -316,7 +610,7 @@ def handle_config_drift(instance_details, healing_attempts):
     db_instance_id = instance_details['DBInstanceIdentifier']
     db_instance_status = instance_details['DBInstanceStatus']
     
-    print(f"Checking configuration drift for DB instance {db_instance_id}")
+    logger.info(f"Checking configuration drift for DB instance {db_instance_id}")
     
     # Check for drift in key attributes
     drift_detected = False
@@ -351,7 +645,7 @@ def handle_config_drift(instance_details, healing_attempts):
     
     # Log and notify about drift
     drift_message = f"Configuration drift detected for DB instance {db_instance_id}:\n" + "\n".join(drift_details)
-    print(drift_message)
+    logger.info(drift_message)
     send_notification(drift_message)
     
     # Apply healing actions based on the type of drift
@@ -360,7 +654,7 @@ def handle_config_drift(instance_details, healing_attempts):
     # Only attempt to fix drift if the instance is available
     if db_instance_status != 'available':
         message = f"DB instance {db_instance_id} is in status {db_instance_status}, cannot fix configuration drift"
-        print(message)
+        logger.info(message)
         send_notification(message)
         return {
             'statusCode': 200,
@@ -378,7 +672,7 @@ def handle_config_drift(instance_details, healing_attempts):
             healing_actions.append(f"Changed instance class from {current_instance_class} to {ORIGINAL_INSTANCE_CLASS}")
         except Exception as e:
             error_message = f"Error fixing instance class drift: {str(e)}"
-            print(error_message)
+            logger.error(error_message)
             healing_actions.append(error_message)
     
     # Fix allocated storage drift if detected
@@ -392,7 +686,7 @@ def handle_config_drift(instance_details, healing_attempts):
             healing_actions.append(f"Changed allocated storage from {current_allocated_storage} to {ORIGINAL_ALLOCATED_STORAGE}")
         except Exception as e:
             error_message = f"Error fixing allocated storage drift: {str(e)}"
-            print(error_message)
+            logger.error(error_message)
             healing_actions.append(error_message)
     
     # Engine version drift is more complex and might require a snapshot restore
@@ -402,7 +696,7 @@ def handle_config_drift(instance_details, healing_attempts):
     
     # Send notification about healing actions
     healing_message = f"Healing actions for DB instance {db_instance_id}:\n" + "\n".join(healing_actions)
-    print(healing_message)
+    logger.info(healing_message)
     send_notification(healing_message)
     
     return {
@@ -462,10 +756,21 @@ def send_notification(message):
         return
     
     try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        formatted_message = f"""
+==========================================================
+RDS SELF-HEALING NOTIFICATION - {timestamp}
+==========================================================
+DB Instance ID: {DB_INSTANCE_ID}
+----------------------------------------------------------
+{message}
+==========================================================
+        """
+        
         sns_client.publish(
             TopicArn=SNS_TOPIC_ARN,
             Subject=f"RDS Self-Healing Notification - Instance {DB_INSTANCE_ID}",
-            Message=message
+            Message=formatted_message
         )
     except Exception as e:
-        print(f"Error sending SNS notification: {str(e)}")
+        logger.error(f"Error sending SNS notification: {str(e)}")
